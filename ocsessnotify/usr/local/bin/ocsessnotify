@@ -41,6 +41,7 @@ HOST=""
 PORT=""
 SESSION_ID=""
 TIMEOUT=3
+POST_TIMEOUT=2
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -106,7 +107,7 @@ discover_servers() {
     local tmp pid
     tmp=$(mktemp)
     dns-sd -Z _http._tcp local. >"$tmp" 2>&1 & pid=$!
-    sleep 2
+    sleep 1
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     awk '
@@ -124,21 +125,26 @@ discover_servers() {
 # the most recent session in each project on the server. The server's CWD is
 # queried as well so sessions in the global (non-repo) project are covered.
 most_recent_session() {
-  local host="$1" port="$2" projects cwd wt enc out
+  local host="$1" port="$2" projects cwd tmp
   projects=$(curl -s --max-time "$TIMEOUT" "http://${host}:${port}/project")
   cwd=$(curl -s --max-time "$TIMEOUT" "http://${host}:${port}/path" |
     jq -r '.directory // empty')
-  {
-    echo "$projects" | jq -r '.[].worktree // empty'
-    echo "$cwd"
-  } | sort -u | while IFS= read -r wt; do
+  tmp=$(mktemp)
+  while IFS= read -r wt; do
     [ -n "$wt" ] || continue
     enc=$(printf '%s' "$wt" | jq -sRr '@uri')
-    out=$(curl -s --max-time "$TIMEOUT" \
-      "http://${host}:${port}/session?order=desc&limit=1&directory=${enc}")
-    echo "$out" | jq -r --arg host "$host" --arg port "$port" \
-      '.[0] | select(. != null) | "\(.time.updated)\t\(.id)\t\($host)\t\($port)"'
-  done
+    ( curl -s --max-time "$TIMEOUT" \
+        "http://${host}:${port}/session?order=desc&limit=1&directory=${enc}" |
+      jq -r --arg host "$host" --arg port "$port" \
+        '.[0] | select(. != null) | "\(.time.updated)\t\(.id)\t\($host)\t\($port)"' ) \
+      >>"$tmp" &
+  done < <({
+    echo "$projects" | jq -r '.[].worktree // empty'
+    echo "$cwd"
+  } | sort -u)
+  wait
+  cat "$tmp"
+  rm -f "$tmp"
 }
 
 # session_exists HOST PORT ID - true if the server knows this session.
@@ -158,7 +164,7 @@ post() {
   local host="$1" port="$2" id="$3" message="$4" payload out rc
   payload=$(jq -cn --arg text "$message" \
     '{noReply:false,parts:[{type:"text",text:$text}]}')
-  out=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" \
+  out=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$POST_TIMEOUT" \
     -X POST "http://${host}:${port}/session/${id}/message" \
     -H "Content-Type: application/json" -d "$payload" 2>/dev/null)
   rc=$?
