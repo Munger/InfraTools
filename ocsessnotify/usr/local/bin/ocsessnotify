@@ -9,7 +9,9 @@
 # This tool only talks REST to opencode's HTTP API. It does no SSH, no
 # terminal notifications - it posts a message to a session and exits.
 
-VERSION=$(dpkg-query -W -f='${Version}' ocsessnotify 2>/dev/null || echo "unknown")
+VERSION=$(dpkg-query -W -f='${Version}' ocsessnotify 2>/dev/null)
+[ -n "$VERSION" ] || VERSION=$(brew list --versions ocsessnotify 2>/dev/null | awk '{print $2}')
+[ -n "$VERSION" ] || VERSION="unknown"
 
 usage() {
   cat <<'EOF'
@@ -89,15 +91,33 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq not found" >&2; exit 1; }
 
 # discover_servers - emit "HOST<TAB>PORT" lines for opencode-* HTTP services.
 # avahi-browse -p is CSV-ish: =;iface;proto;name;type;domain;host;address;port;txt
+# dns-sd -Z is the macOS/Bonjour equivalent: PTR lines name the service, the
+# matching SRV line carries the target hostname and port. mDNS hostnames such
+# as "opencode.local." resolve natively via the system resolver.
 discover_servers() {
-  command -v avahi-browse >/dev/null 2>&1 || {
-    echo "Error: avahi-browse not found (package avahi-utils)" >&2
-    return 1
-  }
-  avahi-browse -r -t -p _http._tcp 2>/dev/null | awk -F';' '
-    $1 == "=" && $4 ~ /^opencode-/ && NF >= 9 {
-      print $8 "\t" $9
-    }' | sort -t$'\t' -k2,2 -k1,1 | awk -F'\t' '!seen[$2]++'
+  if command -v avahi-browse >/dev/null 2>&1; then
+    avahi-browse -r -t -p _http._tcp 2>/dev/null | awk -F';' '
+      $1 == "=" && $4 ~ /^opencode-/ && NF >= 9 {
+        print $8 "\t" $9
+      }' | sort -t$'\t' -k2,2 -k1,1 | awk -F'\t' '!seen[$2]++'
+    return
+  fi
+  if command -v dns-sd >/dev/null 2>&1; then
+    local tmp pid
+    tmp=$(mktemp)
+    dns-sd -Z _http._tcp local. >"$tmp" 2>&1 & pid=$!
+    sleep 2
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    awk '
+      $2 == "PTR" && $3 ~ /^opencode-/ { inst[$3] = 1 }
+      $2 == "SRV" && $1 in inst { print $6 "\t" $5 }
+    ' "$tmp" | sort -t$'\t' -k2,2 -k1,1 | awk -F'\t' '!seen[$2]++'
+    rm -f "$tmp"
+    return
+  fi
+  echo "Error: neither avahi-browse nor dns-sd found" >&2
+  return 1
 }
 
 # most_recent_session HOST PORT - emit "UPDATED<TAB>ID<TAB>HOST<TAB>PORT" for
