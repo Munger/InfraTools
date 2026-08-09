@@ -41,7 +41,7 @@ HOST=""
 PORT=""
 SESSION_ID=""
 TIMEOUT=3
-POST_TIMEOUT=2
+POST_TIMEOUT=1.5
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -104,10 +104,15 @@ discover_servers() {
     return
   fi
   if command -v dns-sd >/dev/null 2>&1; then
-    local tmp pid
+    local tmp pid n
     tmp=$(mktemp)
     dns-sd -Z _http._tcp local. >"$tmp" 2>&1 & pid=$!
-    sleep 1
+    n=0
+    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 10 ] &&
+        ! grep -qE '^opencode-[^[:space:]]+[[:space:]]+SRV[[:space:]]' "$tmp"; do
+      sleep 0.1
+      n=$((n + 1))
+    done
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     awk '
@@ -122,10 +127,20 @@ discover_servers() {
 }
 
 # most_recent_session HOST PORT - emit "UPDATED<TAB>ID<TAB>HOST<TAB>PORT" for
-# the most recent session in each project on the server. The server's CWD is
-# queried as well so sessions in the global (non-repo) project are covered.
+# the most recent session on the server. /session lists sessions across every
+# project (including the global non-repo project) ordered by recency, so one
+# request suffices. Falls back to a parallel per-project scan for servers that
+# cannot list sessions globally.
 most_recent_session() {
-  local host="$1" port="$2" projects cwd tmp
+  local host="$1" port="$2" out line projects cwd tmp
+  out=$(curl -s --max-time "$TIMEOUT" \
+    "http://${host}:${port}/session?scope=project&order=desc&limit=1")
+  line=$(printf '%s' "$out" | jq -r --arg host "$host" --arg port "$port" \
+    '.[0] | select(. != null) | "\(.time.updated)\t\(.id)\t\($host)\t\($port)"')
+  if [ -n "$line" ]; then
+    printf '%s\n' "$line"
+    return
+  fi
   projects=$(curl -s --max-time "$TIMEOUT" "http://${host}:${port}/project")
   cwd=$(curl -s --max-time "$TIMEOUT" "http://${host}:${port}/path" |
     jq -r '.directory // empty')
