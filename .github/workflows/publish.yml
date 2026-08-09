@@ -1,0 +1,51 @@
+name: build-and-publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .deb packages
+        run: |
+          for pkgdir in */; do
+            [ -d "$pkgdir/DEBIAN" ] || continue
+            pkgname=$(basename "$pkgdir")
+            version=$(grep "^Version:" "${pkgdir}DEBIAN/control" | head -1 | awk '{print $2}')
+            arch=$(grep "^Architecture:" "${pkgdir}DEBIAN/control" | head -1 | awk '{print $2}')
+            dpkg-deb --build "$pkgdir" "${pkgname}_${version}_${arch}.deb"
+            echo "Built: ${pkgname}_${version}_${arch}.deb"
+          done
+
+      - name: Push .deb files to apt-packages
+        env:
+          APT_KEY: ${{ secrets.APT_REPO_TOKEN }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$APT_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --quiet git@github.com:MungerWare/apt-packages.git apt-repo
+          for deb in *.deb; do
+            pkgname="${deb%%_*}"
+            prefix="${pkgname:0:1}"
+            mkdir -p "apt-repo/pool/main/$prefix/$pkgname"
+            cp "$deb" "apt-repo/pool/main/$prefix/$pkgname/"
+            echo "Staged: $pkgname/$deb"
+          done
+          cd apt-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Publish packages from Munger/InfraTools"
+          git push
