@@ -127,20 +127,13 @@ discover_servers() {
 }
 
 # most_recent_session HOST PORT - emit "UPDATED<TAB>ID<TAB>HOST<TAB>PORT" for
-# the most recent session on the server. /session lists sessions across every
-# project (including the global non-repo project) ordered by recency, so one
-# request suffices. Falls back to a parallel per-project scan for servers that
-# cannot list sessions globally.
+# the most recent session on the server. The /session endpoint is scoped to a
+# single project (the server's own launch directory unless a directory is
+# given), so finding the most recent session across every project requires a
+# per-project scan. Each project is queried in parallel for its most recent
+# session; the caller picks the newest by updated.
 most_recent_session() {
-  local host="$1" port="$2" out line projects cwd tmp
-  out=$(curl -s --max-time "$TIMEOUT" \
-    "http://${host}:${port}/session?scope=project&order=desc&limit=1")
-  line=$(printf '%s' "$out" | jq -r --arg host "$host" --arg port "$port" \
-    '.[0] | select(. != null) | "\(.time.updated)\t\(.id)\t\($host)\t\($port)"')
-  if [ -n "$line" ]; then
-    printf '%s\n' "$line"
-    return
-  fi
+  local host="$1" port="$2" projects cwd tmp
   projects=$(curl -s --max-time "$TIMEOUT" "http://${host}:${port}/project")
   cwd=$(curl -s --max-time "$TIMEOUT" "http://${host}:${port}/path" |
     jq -r '.directory // empty')
@@ -171,24 +164,19 @@ session_exists() {
 
 # post HOST PORT ID MESSAGE - POST the message to the session.
 #
-# The message endpoint streams the AI reply before closing the connection, so a
-# successful post can time out client-side while curl reads the body (exit 28,
-# HTTP 000) even though the message already landed. Exit 0 with HTTP 200, or
-# exit 28, both count as delivered; anything else is a real failure.
+# The prompt_async endpoint records the message and returns 204 immediately;
+# the session's agent generates the reply asynchronously, so there is no reply
+# stream to wait on and no timeout. A 2xx response means delivered.
 post() {
   local host="$1" port="$2" id="$3" message="$4" payload out rc
   payload=$(jq -cn --arg text "$message" \
     '{noReply:false,parts:[{type:"text",text:$text}]}')
   out=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$POST_TIMEOUT" \
-    -X POST "http://${host}:${port}/session/${id}/message" \
+    -X POST "http://${host}:${port}/session/${id}/prompt_async" \
     -H "Content-Type: application/json" -d "$payload" 2>/dev/null)
   rc=$?
-  if [ "$rc" -eq 0 ] && [ "$out" = "200" ]; then
+  if [ "$rc" -eq 0 ] && [ "${out#2}" != "$out" ]; then
     echo "Posted to session ${id} on ${host}:${port}"
-    return 0
-  fi
-  if [ "$rc" -eq 28 ]; then
-    echo "Posted to session ${id} on ${host}:${port} (reply stream timed out)"
     return 0
   fi
   echo "Error: POST to ${host}:${port} session ${id} failed (curl exit ${rc}, HTTP ${out})" >&2
