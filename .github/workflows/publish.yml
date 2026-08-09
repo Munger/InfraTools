@@ -28,13 +28,9 @@ jobs:
 
       - name: Push .deb files to apt-packages
         env:
-          APT_KEY: ${{ secrets.APT_REPO_TOKEN }}
+          APT_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
         run: |
-          mkdir -p ~/.ssh
-          echo "$APT_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          git clone --quiet git@github.com:MungerWare/apt-packages.git apt-repo
+          git clone --quiet "https://x-access-token:${APT_TOKEN}@github.com/MungerWare/apt-packages.git" apt-repo
           for deb in *.deb; do
             pkgname="${deb%%_*}"
             prefix="${pkgname:0:1}"
