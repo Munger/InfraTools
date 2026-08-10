@@ -8,6 +8,12 @@
 #
 # This tool only talks REST to opencode's HTTP API. It does no SSH, no
 # terminal notifications - it posts a message to a session and exits.
+#
+# Posting is async by default (prompt_async, HTTP 204, reply generated in the
+# background). --sync posts via the blocking /prompt endpoint and prints the
+# reply text. --no-reply records the message without triggering an AI turn.
+# --abort interrupts the target session's running turn. --list shows recent
+# sessions. --json makes status output machine-readable.
 
 VERSION=$(dpkg-query -W -f='${Version}' ocsessnotify 2>/dev/null)
 [ -n "$VERSION" ] || VERSION=$(brew list --versions ocsessnotify 2>/dev/null | awk '{print $2}')
@@ -15,25 +21,36 @@ VERSION=$(dpkg-query -W -f='${Version}' ocsessnotify 2>/dev/null)
 
 usage() {
   cat <<'EOF'
-Usage: ocsessnotify [OPTIONS] MESSAGE
+Usage: ocsessnotify [OPTIONS] [MESSAGE]
 
-Post MESSAGE to the most recent opencode session on the LAN.
+Post MESSAGE to the most recent opencode session on the LAN, or abort/list
+sessions without a MESSAGE.
 
 By default servers are discovered via mDNS and the session with the most
 recent activity across all discovered servers is used.
 
 Options:
-  -h, --help          Show this help and exit
-  -v, --version       Show version and exit
-  -H, --host HOST     Server hostname/IP (default: 127.0.0.1)
-  -p, --port PORT     Server port (default: 4096)
-  -s, --session-id ID Post to this session ID instead of the most recent one
-  -t, --timeout SECS  Per-request timeout in seconds (default: 3)
+  -h, --help           Show this help and exit
+  -v, --version        Show version and exit
+  -H, --host HOST      Server hostname/IP (default: 127.0.0.1)
+  -p, --port PORT      Server port (default: 4096)
+  -s, --session-id ID  Target this session ID instead of the most recent one
+  -d, --directory DIR  Target the most recent session in this project directory
+  -t, --timeout SECS   Per-request timeout in seconds (default: 3)
+      --sync           Post via /prompt and print the reply text (blocking)
+      --async          Post via prompt_async, do not wait for a reply (default)
+      --no-reply       Record the message without triggering an AI turn
+      --abort          Abort the target session's running turn
+      --list [N]       List the N most recent sessions and exit (default: 5)
+      --json           Machine-readable JSON status output
 
 Examples:
   ocsessnotify "deploy complete"
-  ocsessnotify --host macstudio.stack --port 4096 "deploy complete"
-  ocsessnotify --session-id ses_1234 "specific session"
+  ocsessnotify --directory /srv/myproject "build finished"
+  ocsessnotify --no-reply "housekeeping note"
+  ocsessnotify --sync "what is the deploy status?"
+  ocsessnotify --abort
+  ocsessnotify --list --json
 EOF
 }
 
@@ -42,6 +59,13 @@ PORT=""
 SESSION_ID=""
 TIMEOUT=3
 POST_TIMEOUT=1.5
+SYNC_TIMEOUT=300
+DIRECTORY=""
+NO_REPLY=0
+ABORT=0
+SYNC=0
+JSON=0
+LIST_N=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -65,9 +89,45 @@ while [ "$#" -gt 0 ]; do
       SESSION_ID="$2"
       shift 2
       ;;
+    -d|--directory)
+      DIRECTORY="$2"
+      shift 2
+      ;;
     -t|--timeout)
       TIMEOUT="$2"
       shift 2
+      ;;
+    --sync)
+      SYNC=1
+      shift
+      ;;
+    --async)
+      SYNC=0
+      shift
+      ;;
+    --no-reply)
+      NO_REPLY=1
+      shift
+      ;;
+    --abort)
+      ABORT=1
+      shift
+      ;;
+    --list)
+      case "$2" in
+        ''|*[!0-9]*)
+          LIST_N=5
+          shift
+          ;;
+        *)
+          LIST_N="$2"
+          shift 2
+          ;;
+      esac
+      ;;
+    --json)
+      JSON=1
+      shift
       ;;
     -*)
       echo "Error: unknown option '$1'" >&2
@@ -81,7 +141,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 MESSAGE="$*"
-if [ -z "$MESSAGE" ]; then
+if [ -z "$MESSAGE" ] && [ "$ABORT" -eq 0 ] && [ -z "$LIST_N" ]; then
   echo "Error: no message given" >&2
   usage >&2
   exit 1
@@ -126,9 +186,9 @@ discover_servers() {
   return 1
 }
 
-# most_recent_session HOST PORT - emit "UPDATED<TAB>ID<TAB>HOST<TAB>PORT" for
-# the most recent session on the server. The /session endpoint is scoped to a
-# single project (the server's own launch directory unless a directory is
+# most_recent_session HOST PORT - emit "UPDATED<TAB>ID<TAB>DIR<TAB>HOST<TAB>PORT"
+# for the most recent session on the server. The /session endpoint is scoped to
+# a single project (the server's own launch directory unless a directory is
 # given), so finding the most recent session across every project requires a
 # per-project scan. Each project is queried in parallel for its most recent
 # session; the caller picks the newest by updated.
@@ -144,7 +204,7 @@ most_recent_session() {
     ( curl -s --max-time "$TIMEOUT" \
         "http://${host}:${port}/session?order=desc&limit=1&directory=${enc}" |
       jq -r --arg host "$host" --arg port "$port" \
-        '.[0] | select(. != null) | "\(.time.updated)\t\(.id)\t\($host)\t\($port)"' ) \
+        '.[] | select(. != null) | "\(.time.updated)\t\(.id)\t\(.directory)\t\($host)\t\($port)"' ) \
       >>"$tmp" &
   done < <({
     echo "$projects" | jq -r '.[].worktree // empty'
@@ -155,6 +215,28 @@ most_recent_session() {
   rm -f "$tmp"
 }
 
+# scoped_session_lines HOST PORT DIR [LIMIT] - emit the LIMIT most recent
+# sessions within DIR, same tab-separated line format as most_recent_session.
+scoped_session_lines() {
+  local host="$1" port="$2" dir="$3" limit="${4:-1}"
+  enc=$(printf '%s' "$dir" | jq -sRr '@uri')
+  curl -s --max-time "$TIMEOUT" \
+    "http://${host}:${port}/session?order=desc&limit=${limit}&directory=${enc}" |
+    jq -r --arg host "$host" --arg port "$port" \
+      '.[] | select(. != null) | "\(.time.updated)\t\(.id)\t\(.directory)\t\($host)\t\($port)"'
+}
+
+# candidate_lines HOST PORT [LIMIT] - recent session lines for one server,
+# scoped to DIRECTORY when set, otherwise the per-project scan.
+candidate_lines() {
+  local host="$1" port="$2" limit="${3:-1}"
+  if [ -n "$DIRECTORY" ]; then
+    scoped_session_lines "$host" "$port" "$DIRECTORY" "$limit"
+  else
+    most_recent_session "$host" "$port"
+  fi
+}
+
 # session_exists HOST PORT ID - true if the server knows this session.
 session_exists() {
   local host="$1" port="$2" id="$3"
@@ -162,32 +244,90 @@ session_exists() {
     jq -e '.id != null' >/dev/null 2>&1
 }
 
-# post HOST PORT ID MESSAGE - POST the message to the session.
+# post HOST PORT ID MESSAGE - send MESSAGE to the session.
 #
-# The prompt_async endpoint records the message and returns 204 immediately;
-# the session's agent generates the reply asynchronously, so there is no reply
-# stream to wait on and no timeout. A 2xx response means delivered.
+# Async mode posts to prompt_async (HTTP 204) and returns immediately; the
+# session's agent generates the reply in the background. Sync mode posts to
+# the blocking /prompt endpoint, waits for the turn to finish and prints the
+# reply text. --no-reply sets noReply:true so no turn is triggered at all.
 post() {
-  local host="$1" port="$2" id="$3" message="$4" payload out rc
-  payload=$(jq -cn --arg text "$message" \
-    '{noReply:false,parts:[{type:"text",text:$text}]}')
+  local host="$1" port="$2" id="$3" message="$4" noReply payload out rc reply
+  if [ "$NO_REPLY" -eq 1 ]; then noReply=true; else noReply=false; fi
+  payload=$(jq -cn --argjson nr "$noReply" --arg text "$message" \
+    '{noReply:$nr,parts:[{type:"text",text:$text}]}')
+  if [ "$SYNC" -eq 1 ]; then
+    out=$(curl -s --max-time "$SYNC_TIMEOUT" \
+      -X POST "http://${host}:${port}/session/${id}/message" \
+      -H "Content-Type: application/json" -d "$payload")
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      reply=$(printf '%s' "$out" |
+        jq -r '[.parts[]? | select(.type == "text") | .text] | join("\n")')
+      if [ "$JSON" -eq 1 ]; then
+        jq -nc --arg s "$id" --arg h "$host" --arg p "$port" --arg r "$reply" \
+          '{session:$s,host:$h,port:$p,status:"replied",reply:$r}'
+      else
+        printf '%s' "$reply"
+      fi
+      return 0
+    fi
+    echo "Error: POST to ${host}:${port} session ${id} failed (curl exit ${rc})" >&2
+    return 1
+  fi
   out=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$POST_TIMEOUT" \
     -X POST "http://${host}:${port}/session/${id}/prompt_async" \
     -H "Content-Type: application/json" -d "$payload" 2>/dev/null)
   rc=$?
   if [ "$rc" -eq 0 ] && [ "${out#2}" != "$out" ]; then
-    echo "Posted to session ${id} on ${host}:${port}"
+    if [ "$JSON" -eq 1 ]; then
+      jq -nc --arg s "$id" --arg h "$host" --arg p "$port" \
+        '{session:$s,host:$h,port:$p,status:"posted"}'
+    else
+      echo "Posted to session ${id} on ${host}:${port}"
+    fi
     return 0
   fi
   echo "Error: POST to ${host}:${port} session ${id} failed (curl exit ${rc}, HTTP ${out})" >&2
   return 1
 }
 
+# abort_session HOST PORT ID - interrupt the session's running turn.
+abort_session() {
+  local host="$1" port="$2" id="$3" out rc
+  out=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$POST_TIMEOUT" \
+    -X POST "http://${host}:${port}/session/${id}/abort")
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ "${out#2}" != "$out" ]; then
+    if [ "$JSON" -eq 1 ]; then
+      jq -nc --arg s "$id" --arg h "$host" --arg p "$port" \
+        '{session:$s,host:$h,port:$p,status:"aborted"}'
+    else
+      echo "Aborted session ${id} on ${host}:${port}"
+    fi
+    return 0
+  fi
+  echo "Error: abort of ${host}:${port} session ${id} failed (curl exit ${rc}, HTTP ${out})" >&2
+  return 1
+}
+
+# print_list LINES - render sorted "UPDATED<TAB>ID<TAB>DIR<TAB>HOST<TAB>PORT"
+# lines as a table or JSON array.
+print_list() {
+  if [ "$JSON" -eq 1 ]; then
+    printf '%s\n' "$1" |
+      jq -Rr 'select(length > 0) | split("\t") as $f |
+        {session:$f[1],directory:$f[2],updated:($f[0] | tonumber),host:$f[3],port:($f[4] | tonumber)}' |
+      jq -s '.'
+  else
+    printf '%s\n' "$1" | awk -F'\t' '{printf "%s\t%s\t%s\n",$2,$3,$1}'
+  fi
+}
+
 TARGET_HOST="${HOST:-127.0.0.1}"
 TARGET_PORT="${PORT:-4096}"
 
 if [ -z "$HOST" ] && [ -z "$PORT" ]; then
-  # mDNS discovery mode
+  # mDNS discovery mode.
   SERVERS=$(discover_servers) || exit 1
   if [ -z "$SERVERS" ]; then
     echo "Error: no opencode servers discovered via mDNS" >&2
@@ -208,13 +348,29 @@ if [ -z "$HOST" ] && [ -z "$PORT" ]; then
       echo "Error: session ${SESSION_ID} not found on any discovered server" >&2
       exit 1
     fi
+  elif [ -n "$LIST_N" ]; then
+    # List mode: gather recent sessions across every discovered server.
+    ALL=""
+    while IFS=$'\t' read -r sh sp; do
+      [ -n "$sh" ] || continue
+      ALL="${ALL}
+$(candidate_lines "$sh" "$sp" "$LIST_N")"
+    done <<<"$SERVERS"
+    ALL=$(printf '%s\n' "$ALL" | sed '/^[[:space:]]*$/d' |
+      sort -t$'\t' -k1,1 -rn | head -n "$LIST_N")
+    if [ -z "$ALL" ]; then
+      echo "Error: no sessions found on any discovered server" >&2
+      exit 1
+    fi
+    print_list "$ALL"
+    exit 0
   else
     # Most recent session across all discovered servers.
     BEST=""
     while IFS=$'\t' read -r sh sp; do
       [ -n "$sh" ] || continue
       BEST="${BEST}
-$(most_recent_session "$sh" "$sp")"
+$(candidate_lines "$sh" "$sp")"
     done <<<"$SERVERS"
     BEST=$(printf '%s\n' "$BEST" | sed '/^[[:space:]]*$/d' |
       sort -t$'\t' -k1,1 -rn | head -1)
@@ -222,14 +378,24 @@ $(most_recent_session "$sh" "$sp")"
       echo "Error: no sessions found on any discovered server" >&2
       exit 1
     fi
-    TARGET_HOST=$(printf '%s\n' "$BEST" | cut -f3)
-    TARGET_PORT=$(printf '%s\n' "$BEST" | cut -f4)
+    TARGET_HOST=$(printf '%s\n' "$BEST" | cut -f4)
+    TARGET_PORT=$(printf '%s\n' "$BEST" | cut -f5)
     SESSION_ID=$(printf '%s\n' "$BEST" | cut -f2)
   fi
 else
   # Explicit host/port: session must be given or derived from that server.
+  if [ -n "$LIST_N" ]; then
+    ALL=$(candidate_lines "$TARGET_HOST" "$TARGET_PORT" "$LIST_N" |
+      sort -t$'\t' -k1,1 -rn | head -n "$LIST_N")
+    if [ -z "$ALL" ]; then
+      echo "Error: no sessions found on ${TARGET_HOST}:${TARGET_PORT}" >&2
+      exit 1
+    fi
+    print_list "$ALL"
+    exit 0
+  fi
   if [ -z "$SESSION_ID" ]; then
-    BEST=$(most_recent_session "$TARGET_HOST" "$TARGET_PORT" |
+    BEST=$(candidate_lines "$TARGET_HOST" "$TARGET_PORT" |
       sort -t$'\t' -k1,1 -rn | head -1)
     if [ -z "$BEST" ]; then
       echo "Error: no sessions found on ${TARGET_HOST}:${TARGET_PORT}" >&2
@@ -237,6 +403,11 @@ else
     fi
     SESSION_ID=$(printf '%s\n' "$BEST" | cut -f2)
   fi
+fi
+
+if [ "$ABORT" -eq 1 ]; then
+  abort_session "$TARGET_HOST" "$TARGET_PORT" "$SESSION_ID"
+  exit $?
 fi
 
 post "$TARGET_HOST" "$TARGET_PORT" "$SESSION_ID" "$MESSAGE"
